@@ -1,0 +1,49 @@
+name: mixi Auto Post
+
+on:
+  schedule:
+    # 8:00 JST = 23:00 UTC (previous day)
+    - cron: '0 23 * * *'
+    # 13:00 JST = 04:00 UTC
+    - cron: '0 4 * * *'
+    # 21:00 JST = 12:00 UTC
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Decode cookies
+        run: echo "$MIXI_COOKIES" | base64 -d > mixi_cookies.json
+        env:
+          MIXI_COOKIES: ${{ secrets.MIXI_COOKIES }}
+
+      - name: Run upload script
+        run: python upload.py
+        env:
+          GDRIVE_FOLDER_ID_MIXI: ${{ secrets.GDRIVE_FOLDER_ID_MIXI }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Commit uploaded_mixi.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add uploaded_mixi.json
+          git diff --cached --quiet || git commit -m "Update uploaded_mixi.json [skip ci]"
+          git push

@@ -1,0 +1,9 @@
+mixi_cookies.json
+mixi_cookies_base64.txt
+test_*.py
+debug_*.py
+*.png
+__pycache__/
+.env
+images/
+test_images/
