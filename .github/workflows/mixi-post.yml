@@ -28,10 +28,27 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Decode cookies
-        run: echo "$MIXI_COOKIES" | base64 -d > mixi_cookies.json
+      - name: Validate required secrets
         env:
           MIXI_COOKIES: ${{ secrets.MIXI_COOKIES }}
+          GDRIVE_FOLDER_ID_MIXI: ${{ secrets.GDRIVE_FOLDER_ID_MIXI }}
+        run: |
+          [ -n "$MIXI_COOKIES" ] || (echo "MIXI_COOKIES is empty" && exit 1)
+          [ -n "$GDRIVE_FOLDER_ID_MIXI" ] || (echo "GDRIVE_FOLDER_ID_MIXI is empty" && exit 1)
+
+      - name: Decode cookies
+        env:
+          MIXI_COOKIES: ${{ secrets.MIXI_COOKIES }}
+        run: |
+          python -c "import os,base64,pathlib; pathlib.Path('mixi_cookies.json').write_bytes(base64.b64decode(os.environ['MIXI_COOKIES']))"
+          python -c "import json; json.load(open('mixi_cookies.json', encoding='utf-8')); print('mixi_cookies.json is valid JSON')"
+      - name: Show runtime versions
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python --version
+          google-chrome --version || true
+          python -c "import selenium; print('selenium', selenium.__version__)"
 
       - name: Run upload (attempt 1)
         id: attempt1
@@ -114,3 +131,13 @@ jobs:
                 \"text\": \"✅ mixi自動投稿 成功${RETRY_INFO}\n時刻: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M JST')\"
               }]
             }"
+
+      - name: Upload debug artifacts on failure
+        if: steps.attempt1.outcome == 'failure' && (steps.attempt2.outcome == 'failure' || steps.attempt2.outcome == 'skipped') && (steps.attempt3.outcome == 'failure' || steps.attempt3.outcome == 'skipped')
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixi-debug-${{ github.run_id }}
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore

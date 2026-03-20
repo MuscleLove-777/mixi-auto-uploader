@@ -18,6 +18,11 @@ from selenium.webdriver.support import expected_conditions as EC
 
 from mixi_auth import create_driver, navigate_to_diary_editor, human_delay
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "mixi_cookies.json")
 
 
@@ -235,9 +240,23 @@ def _list_via_gdown(folder_id):
 def download_single_image(file_id):
     """Google Driveから1ファイルをダウンロード"""
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return resp.content
+
+
+def dump_debug_artifacts(driver, prefix="mixi_debug"):
+    """失敗解析用にスクリーンショットとHTMLを保存する"""
+    ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+    screenshot = f"{prefix}_{ts}.png"
+    html_file = f"{prefix}_{ts}.html"
+    try:
+        driver.save_screenshot(screenshot)
+        with open(html_file, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print(f"Debug artifacts saved: {screenshot}, {html_file}")
+    except Exception as e:
+        print(f"Debug artifact save failed: {e}")
 
 
 # ===== タグ・テキスト生成 =====
@@ -333,8 +352,28 @@ def post_diary_entry(driver, title, body_text, image_path, tags):
                 print(f"画像アップロードエラー（続行）: {e}")
             human_delay(2, 3)
 
-        # --- 3. 本文入力 (textarea[name="diary_body"]) ---
-        body_textarea = driver.find_element(By.CSS_SELECTOR, 'textarea[name="diary_body"]')
+        # --- 3. 本文入力 ---
+        body_textarea = None
+        for selector in [
+            'textarea[name="diary_body"]',
+            'textarea[name="body"]',
+            'textarea[id*="diary"]',
+            'textarea[id*="body"]',
+            "textarea",
+        ]:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            for el in elements:
+                if el.is_displayed():
+                    body_textarea = el
+                    break
+            if body_textarea:
+                break
+
+        if not body_textarea:
+            print("Error: 本文入力欄が見つかりません")
+            dump_debug_artifacts(driver, "mixi_body_not_found")
+            return False
+
         driver.execute_script(
             "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input'));",
             body_textarea, body_text
@@ -347,9 +386,28 @@ def post_diary_entry(driver, title, body_text, image_path, tags):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
 
-        confirm_btn = driver.find_element(By.CSS_SELECTOR, 'input[value*="確認"]')
+        confirm_btn = None
+        candidates = driver.find_elements(By.CSS_SELECTOR, "input[type='submit'], input[type='button'], button")
+        for btn in candidates:
+            if not btn.is_displayed() or not btn.is_enabled():
+                continue
+            label = ((btn.text or "") + " " + (btn.get_attribute("value") or "")).strip()
+            if any(k in label for k in ["確認", "次へ", "投稿", "作成", "送信"]):
+                confirm_btn = btn
+                break
+
+        if not confirm_btn:
+            print("Error: 確認/投稿ボタンが見つかりません")
+            dump_debug_artifacts(driver, "mixi_confirm_not_found")
+            return False
+
+        confirm_label = ""
+        try:
+            confirm_label = ((confirm_btn.text or "") + " " + (confirm_btn.get_attribute("value") or "")).strip()
+        except Exception:
+            confirm_label = "unknown"
         confirm_btn.click()
-        print(f"  確認ボタン: '{confirm_btn.get_attribute('value')}'")
+        print(f"  確認ボタン: '{confirm_label}'")
 
         # --- 5. 確認画面を待つ ---
         time.sleep(5)
@@ -357,11 +415,34 @@ def post_diary_entry(driver, title, body_text, image_path, tags):
 
         # --- 6. 最終投稿ボタン (input[value="作成する"]) ---
         print("作成するボタンをクリック中...")
-        submit_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[value="作成する"]'))
-        )
-        submit_btn.click()
-        print("  最終投稿ボタン: '作成する'")
+        submit_btn = None
+        try:
+            submit_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[value="作成する"]'))
+            )
+        except Exception:
+            pass
+
+        if not submit_btn:
+            final_candidates = driver.find_elements(By.CSS_SELECTOR, "input[type='submit'], input[type='button'], button")
+            for btn in final_candidates:
+                if not btn.is_displayed() or not btn.is_enabled():
+                    continue
+                label = ((btn.text or "") + " " + (btn.get_attribute("value") or "")).strip()
+                if any(k in label for k in ["作成", "投稿", "公開", "送信", "完了"]):
+                    submit_btn = btn
+                    break
+
+        if submit_btn:
+            submit_label = ""
+            try:
+                submit_label = ((submit_btn.text or "") + " " + (submit_btn.get_attribute("value") or "")).strip()
+            except Exception:
+                submit_label = "unknown"
+            submit_btn.click()
+            print(f"  最終投稿ボタン: '{submit_label}'")
+        else:
+            print("最終投稿ボタンを検出できなかったため、確認画面なしフローとして継続判定します")
 
         # --- 7. 投稿成功確認 ("書きあがりました" テキスト) ---
         time.sleep(5)
@@ -392,12 +473,14 @@ def post_diary_entry(driver, title, body_text, image_path, tags):
             return True
 
         print(f"Warning: 投稿結果が確認できません (URL: {current_url})")
+        dump_debug_artifacts(driver, "mixi_post_unconfirmed")
         return False
 
     except Exception as e:
         print(f"投稿エラー: {e}")
         import traceback
         traceback.print_exc()
+        dump_debug_artifacts(driver, "mixi_post_exception")
         return False
 
 
@@ -411,7 +494,7 @@ def load_uploaded_log():
 
 
 def save_uploaded_log(log):
-    with open(UPLOADED_LOG, 'w') as f:
+    with open(UPLOADED_LOG, 'w', encoding="utf-8") as f:
         json.dump(log, f, indent=2)
 
 
