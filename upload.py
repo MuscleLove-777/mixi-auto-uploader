@@ -345,7 +345,10 @@ def post_diary_entry(driver, title, body_text, image_path, tags):
             EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="diary_title"]'))
         )
         title_input.clear()
-        title_input.send_keys(title)
+        driver.execute_script(
+            "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input'));",
+            title_input, title
+        )
         human_delay(1, 2)
         print(f"タイトル入力: {title}")
 
