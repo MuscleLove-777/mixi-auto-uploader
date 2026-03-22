@@ -55,7 +55,9 @@ def create_driver(headless=True):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    driver = webdriver.Chrome(options=options)
+    service = Service()
+    service.start_error_message = "ChromeDriver failed to start"
+    driver = webdriver.Chrome(service=service, options=options)
 
     # navigator.webdriver を隠す
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {

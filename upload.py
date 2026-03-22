@@ -223,6 +223,10 @@ def _list_via_gdown(folder_id):
         print(f"Download error: {e}")
         # 一部ファイルが失敗しても、ダウンロード済みファイルを使う
 
+    # gdownダウンロード後にメモリを解放（後続のSelenium起動タイムアウト対策）
+    import gc
+    gc.collect()
+
     images = []
     for root, dirs, filenames in os.walk(dl_dir):
         for fname in filenames:
@@ -234,6 +238,11 @@ def _list_via_gdown(folder_id):
                     "name": fname,
                     "local_path": fpath,
                 })
+
+    if not images:
+        print("gdownで画像を取得できませんでした（0ファイル）")
+        return []
+
     return images
 
 
@@ -585,8 +594,20 @@ def main():
     # Seleniumで日記投稿
     driver = None
     try:
-        print("Chromeブラウザを起動中...")
-        driver = create_driver(headless=True)
+        # Chromeブラウザ起動（タイムアウト時リトライ付き）
+        for attempt in range(3):
+            try:
+                print(f"Chromeブラウザを起動中... (attempt {attempt + 1}/3)")
+                driver = create_driver(headless=True)
+                break
+            except Exception as e:
+                print(f"ブラウザ起動エラー (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    print("10秒後にリトライ...")
+                    time.sleep(10)
+                else:
+                    print("ブラウザ起動に3回失敗しました")
+                    return 1
 
         # Cookieログイン（reCAPTCHA回避）
         if not login_with_cookies(driver):
