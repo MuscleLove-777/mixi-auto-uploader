@@ -16,7 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from mixi_auth import create_driver, navigate_to_diary_editor, human_delay
+from mixi_auth import create_driver, navigate_to_diary_editor, human_delay, safe_driver_get
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -36,7 +36,9 @@ def login_with_cookies(driver):
         cookies = json.load(f)
 
     # まずmixi.jpにアクセスしてドメインを設定
-    driver.get("https://mixi.jp/")
+    if not safe_driver_get(driver, "https://mixi.jp/"):
+        print("Error: mixi.jp への接続がタイムアウトしました（ネットワークまたは mixi 側の遅延）")
+        return False
     human_delay(2, 3)
 
     # Cookieを追加
@@ -50,7 +52,9 @@ def login_with_cookies(driver):
             pass  # ドメインが違うCookieはスキップ
 
     # ホームページにアクセスしてログイン確認
-    driver.get("https://mixi.jp/home.pl")
+    if not safe_driver_get(driver, "https://mixi.jp/home.pl"):
+        print("Error: home.pl への接続がタイムアウトしました")
+        return False
     human_delay(3, 5)
 
     current_url = driver.current_url

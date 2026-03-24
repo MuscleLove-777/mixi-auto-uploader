@@ -14,6 +14,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
+# Selenium→ChromeDriver の HTTP 読み取りタイムアウト（秒）。mixi.jp が重いと 120 秒で落ちるため延長
+REMOTE_HTTP_TIMEOUT_SEC = 360
+
 # --- 定数 ---
 MIXI_TOP_URL = "https://mixi.jp/"
 MIXI_LOGIN_URL = "https://mixi.jp/login.pl"
@@ -36,6 +39,50 @@ def human_delay(min_sec=2, max_sec=5):
     return delay
 
 
+def _extend_remote_http_timeout(driver):
+    """ChromeDriver への HTTP 通信タイムアウトを延長（GitHub Actions で Read timed out 対策）"""
+    try:
+        ce = getattr(driver, "command_executor", None)
+        cfg = getattr(ce, "_client_config", None) if ce else None
+        if cfg is not None and hasattr(cfg, "timeout"):
+            cfg.timeout = REMOTE_HTTP_TIMEOUT_SEC
+    except Exception:
+        pass
+
+
+def safe_driver_get(driver, url, max_attempts=3, page_load_timeout_sec=300):
+    """
+    driver.get のタイムアウト・遅延に耐える。
+    pageLoadStrategy=eager と併用すると効果的。
+    """
+    _extend_remote_http_timeout(driver)
+    try:
+        driver.set_page_load_timeout(page_load_timeout_sec)
+    except Exception:
+        pass
+
+    for attempt in range(max_attempts):
+        try:
+            driver.get(url)
+            return True
+        except TimeoutException:
+            print(f"  Page load timeout: {url} (attempt {attempt + 1}/{max_attempts})")
+        except Exception as e:
+            err = str(e).lower()
+            if "read timed out" in err or "timeout" in err:
+                print(f"  Navigation timeout: {url} (attempt {attempt + 1}/{max_attempts}): {e}")
+            else:
+                raise
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+        time.sleep(5 + attempt * 5)
+
+    print(f"  safe_driver_get failed after {max_attempts} attempts: {url}")
+    return False
+
+
 def create_driver(headless=True):
     """Chrome WebDriverを作成（検出回避設定付き）"""
     options = Options()
@@ -55,9 +102,20 @@ def create_driver(headless=True):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
+    # DOMContentLoaded 付近で先に進む（全リソース待ちで 120s 超えしがち）
+    try:
+        options.page_load_strategy = "eager"
+    except Exception:
+        pass
+
     service = Service()
     service.start_error_message = "ChromeDriver failed to start"
     driver = webdriver.Chrome(service=service, options=options)
+    _extend_remote_http_timeout(driver)
+    try:
+        driver.set_page_load_timeout(300)
+    except Exception:
+        pass
 
     # navigator.webdriver を隠す
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -308,7 +366,9 @@ def navigate_to_diary_editor(driver):
     human_delay(2, 4)
 
     try:
-        driver.get(MIXI_DIARY_EDITOR_URL)
+        if not safe_driver_get(driver, MIXI_DIARY_EDITOR_URL):
+            print("Error: 日記ページへの遷移がタイムアウトしました")
+            return False
         human_delay(3, 5)
 
         current_url = driver.current_url
