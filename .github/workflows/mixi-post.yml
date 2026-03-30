@@ -2,9 +2,8 @@ name: mixi Auto Post
 
 on:
   schedule:
-    - cron: '0 23 * * *'
-    - cron: '0 4 * * *'
-    - cron: '0 12 * * *'
+    # 毎日 JST 12:00 (UTC 3:00)
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 permissions:
