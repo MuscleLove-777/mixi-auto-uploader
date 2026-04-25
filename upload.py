@@ -84,9 +84,38 @@ JST = timezone(timedelta(hours=9))
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID_MIXI", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
-PATREON_LINK = "https://www.patreon.com/cw/MuscleLove"
+PATREON_LINK = "https://www.patreon.com/cw/MuscleLove?utm_source=mixi"
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 UPLOADED_LOG = os.path.join(os.path.dirname(__file__), "uploaded_mixi.json")
+
+# --- MuscleLove バックリンクプール（mixi一般プラットフォーム：フィットネス系のみ） ---
+ML_BACKLINK_POOL_FITNESS = [
+    ("https://musclelove-777.github.io/muscle-meal-girls/", "筋肉女子のマッスルメシ"),
+    ("https://musclelove-777.github.io/runners-lab/", "ランナーラボ"),
+    ("https://musclelove-777.github.io/armwrestling-girls-navi/", "腕相撲女子ナビ"),
+    ("https://musclelove-777.github.io/physique-girls-navi/", "フィジーク女子ナビ"),
+    ("https://musclelove-777.github.io/fighting-girls-navi/", "格闘技女子ナビ"),
+    ("https://musclelove-777.github.io/joshi-prowrestling-navi/", "女子プロレスナビ"),
+    ("https://musclelove-777.github.io/female-physique-queens/", "Female Physique Queens"),
+    ("https://musclelove-777.github.io/network/fitness/", "Fitness Network 15サイト"),
+    ("https://musclelove-777.github.io/network/academy/", "MuscleLove Academy 77"),
+]
+
+
+def build_backlink_block():
+    """MuscleLove バックリンクのプレーンテキストブロック（mixi日記用、ランダム2件）"""
+    try:
+        k = min(2, len(ML_BACKLINK_POOL_FITNESS))
+        selected = random.sample(ML_BACKLINK_POOL_FITNESS, k=k)
+        lines = [f"  ・{n} {u}" for u, n in selected]
+        return (
+            "\n\n"
+            "<!-- ML_BACKLINK -->\n"
+            "▼ 関連サイト\n" + "\n".join(lines) + "\n"
+            "<!-- /ML_BACKLINK -->\n"
+        )
+    except Exception:
+        return ""
 
 # --- タグマッピング（mixi日本語ユーザー向け） ---
 CONTENT_TAG_MAP = {
@@ -331,7 +360,7 @@ def build_body_text(image_name, tags):
         hashtags=hashtags,
         patreon_link=PATREON_LINK,
     )
-    return text.strip()
+    return text.strip() + build_backlink_block()
 
 
 # ===== Selenium 日記投稿 =====
