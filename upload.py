@@ -4,26 +4,58 @@ mixi (mixi.jp) 画像自動投稿（GitHub Actions用）
 Google Driveから画像取得 -> ランダム1枚を日記として投稿 -> アップロード済みを記録
 Selenium使用（mixi公式APIなし）
 """
+from publication_evidence import record_publication_result, identity_from_url
+from promotion_policy import CANONICAL_URL, canonical_cta, strip_plain_promotion, normalize_plain_promotion, normalize_html_promotion
 import sys
+import argparse
+import html
 import json
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
-import requests
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-from mixi_auth import create_driver, navigate_to_diary_editor, human_delay, safe_driver_get
+from pool_loader import as_insights
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
+
+def ensure_live_dependencies():
+    global By, WebDriverWait, EC
+    global create_driver, navigate_to_diary_editor, human_delay, safe_driver_get
+
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from mixi_auth import create_driver, navigate_to_diary_editor, human_delay, safe_driver_get
+
+
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "mixi_cookies.json")
+RUN_STATUS_FILE = os.path.join(os.path.dirname(__file__), "run_status.json")
+EXIT_AUTH_HOLD = 2
+
+
+def is_auth_redirect(url):
+    value = (url or "").lower()
+    return "login" in value or "auth" in value or "session" in value
+
+
+def write_run_status(status, reason="", exit_code=0):
+    data = {
+        "checked_at_jst": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST"),
+        "status": status,
+        "reason": reason,
+        "exit_code": exit_code,
+    }
+    tmp = RUN_STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, RUN_STATUS_FILE)
 
 
 def login_with_cookies(driver):
@@ -58,7 +90,7 @@ def login_with_cookies(driver):
     human_delay(3, 5)
 
     current_url = driver.current_url
-    if "login" in current_url.lower():
+    if is_auth_redirect(current_url):
         print("Error: Cookieが期限切れです。save_cookies.py を再実行してください。")
         return False
 
@@ -68,13 +100,9 @@ def login_with_cookies(driver):
         print("Cookieログイン成功!")
         return True
 
-    # URLがhomeを含んでいれば成功とみなす
-    if "home" in current_url or "mixi.jp" in current_url:
-        if "login" not in current_url.lower():
-            print("Cookieログイン成功! (URL判定)")
-            return True
-
-    print("Error: Cookieログインの確認ができません。save_cookies.py を再実行してください。")
+    # URLだけでは成功扱いしない。期限切れCookieでもトップへ戻る実例があるため、
+    # ページ内の認証証拠が無ければfail-closedする。
+    print("Error: Cookieログインの確実な証拠がありません。save_cookies.py を再実行してください。")
     return False
 
 
@@ -82,11 +110,15 @@ JST = timezone(timedelta(hours=9))
 
 # --- 環境変数 ---
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID_MIXI", "")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-
-PATREON_LINK = "https://www.patreon.com/cw/MuscleLove?utm_source=mixi"
+SAFE_LANE = "safe_fitness"
+SAFE_FALLBACK_CTA = (
+    "まとめはこちら → "
+    "https://musclelove-777.github.io/?utm_source=mixi&utm_medium=autopost"
+)
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 UPLOADED_LOG = os.path.join(os.path.dirname(__file__), "uploaded_mixi.json")
+DRY_RUN_OUTPUT_HTML = os.environ.get("DRY_RUN_OUTPUT_HTML", "dry_run_mixi_diary.html")
+DRY_RUN_OUTPUT_JSON = os.environ.get("DRY_RUN_OUTPUT_JSON", "dry_run_mixi_diary.json")
 
 # --- MuscleLove バックリンクプール（mixi一般プラットフォーム：フィットネス系のみ） ---
 ML_BACKLINK_POOL_FITNESS = [
@@ -139,116 +171,56 @@ CONTENT_TAG_MAP = {
 BASE_TAGS = [
     '筋肉女子', '筋トレ女子', 'マッスルガール', 'フィットネス',
     'ボディメイク', 'ワークアウト', 'ジム', 'トレーニング',
-    'ワキフェチ', '腕フェチ', '筋肉美', 'AI美女', 'むちむち', '褐色美女',
+    '筋肉美', 'AIイラスト', 'AIアート',
 ]
+
+SAFE_FALLBACK_NG = {
+    'uncensored', 'sexy', 'nude', 'porn', 'fetish', 'adult', 'nsfw',
+    '18禁', 'エロ', 'アダルト', '無修正', '裸', 'フェチ', '腕フェチ',
+    'ワキフェチ', 'armpit', 'armpitfetish', 'thicc',
+}
+
+CATEGORY_LABELS = {
+    'training': 'トレーニング',
+    'workout': 'ワークアウト',
+    'pullups': '懸垂',
+    'posing': 'ポージング',
+    'flex': '筋肉美',
+    'muscle': '筋肉美',
+    'bicep': '腕トレ',
+    'abs': '腹筋トレーニング',
+    'leg': '脚トレ',
+    'back': '背中トレーニング',
+    'squat': 'スクワット',
+    'deadlift': 'デッドリフト',
+    'bench': 'ベンチプレス',
+    'competition': 'フィットネス',
+}
 
 # 日記タイトルテンプレート（ランダム選択）
 TITLE_TEMPLATES = [
-    # フォーマル系
-    "【{category}】凛花が体現する筋肉美の極致 💪",
-    "{category} | カイの鍛え抜かれたフィジークに迫る",
-    "ましろの{category}コレクション - MuscleLove Gallery",
-    "【{category}】紫苑が魅せるパワーと美の融合 ✨",
-    "{category} - アヤネのボディメイク記録 | MuscleLove",
-    "凛花×{category} | フィットネスアートの新たな地平",
-    "【{category}】筋肉美女たちの饗宴 - MuscleLove",
-    "{category} | 褐色筋肉美の真髄をお届けします 🔥",
-    "MuscleLove厳選 | 今週の{category}ベストショット",
-    # カジュアル系
-    "カイの{category}見たけどマジでやばいｗｗ 💪",
-    "ましろちゃんの{category}が可愛すぎて無理ｗ 🔥",
-    "今日の紫苑の{category}、推せるしかないんだがｗ ✨",
-    "アヤネの{category}まとめ！控えめに言って最高 💪",
-    "凛花の{category}に心臓もってかれたんだけどｗ 🔥",
-    "え待って、カイの{category}えぐすぎんかｗｗｗ ✨",
-    "ましろ×{category}の破壊力よ…まじ尊い♡ 💪",
-    "紫苑の{category}がトレンド入りしそうなレベル 🔥",
-    "今日のアヤネの{category}がレベチすぎたｗ ✨",
-]
-
-# 日記本文テンプレート（プレーンテキスト、mixi日記はtextarea）
-BODY_TEMPLATES = [
-    """{caption}
-
-{hashtags}
-
-━━━━━━━━━━━━━━━━━━━━
-Patreonで限定コンテンツ配信中!
-{patreon_link}
-ここでしか見れない筋肉美女のコンテンツを毎日更新中
-━━━━━━━━━━━━━━━━━━━━""",
-    """{caption}
-
-{hashtags}
-
-★ Patreonで限定コンテンツ公開中! ★
-{patreon_link}
-毎日更新のオリジナルコンテンツをチェック!""",
-    """{caption}
-
-{hashtags}
-
-▼ More exclusive content on Patreon ▼
-{patreon_link}""",
+    "【{category}】今日の一枚、強い 💪",
+    "{category} | バキバキ。でも美しい",
+    "この{category}、仕上がりエグい 🔥",
+    "筋肉女子の{category}、やっぱ最高",
+    "{category}の積み上げが形になった一枚 ✨",
 ]
 
 # キャプションテンプレート
 CAPTION_TEMPLATES = [
-    "凛花の今日のショット、背中のカットが過去最高に仕上がってる💪 これぞ筋肉美の極み！",
-    "カイのトレーニング後の一枚。汗が光る褐色ボディがもう芸術的すぎて言葉出ないｗ🔥",
-    "ましろちゃんの腕のライン見て！むちむちなのにしっかり筋が入ってるこの絶妙バランス✨",
-    "紫苑のポージング集、毎回クオリティ上がってて末恐ろしいｗ 推し活が止まらん♡💪",
-    "アヤネの全身ショットが圧巻。上半身も下半身も隙なく鍛え上げた美ボディ🔥",
-    "凛花×ましろのツーショット的な並び、タイプ違いすぎて両方推せるの最高じゃんｗ✨",
-    "カイの肩から腕にかけてのラインがヤバい。立体感えぐすぎて実在感すらある💪",
-    "紫苑の腹筋ライン、縦にスッと入ってるの美しすぎん？鍛えた人だけの特権🔥",
-    "ましろのむちむちフィジーク、今日も安定の破壊力ｗｗ 見るだけで元気出る✨",
-    "アヤネのバックショット公開！広背筋の広がりがマジで翼みたい💪♡",
-    "凛花の鎖骨から肩のラインを見てほしい。繊細さと力強さが同居してる奇跡🔥",
-    "カイの褐色ボディ×光の加減が最高すぎる。この一枚は保存確定でしょ✨",
-    "ましろと紫苑、どっちのフィジークが好み？コメントで教えてｗ💪",
-    "アヤネの脚のカット見た？大腿四頭筋のセパレーションが半端ないんだけど🔥",
-    "凛花のワキから二頭筋にかけてのライン、フェチにはたまらん一枚です✨♡",
-    "カイの今日の仕上がりを一言で表すなら「完璧」。それ以外に言葉が見つからない💪",
-    "紫苑ちゃんのリラックスポーズ、力抜いてても筋肉のシルエットが美しいのすごい🔥",
-    "MuscleLoveの筋肉美女たち、全員違う魅力があるから飽きないのよｗ✨",
+    "見てくれ、この圧。",
+    "今日の一枚、強い。",
+    "これは仕上がりエグい。",
+    "筋肉女子、やっぱ最高。",
+    "バキバキ。でも美しい。",
 ]
 
 
 # ===== Google Drive =====
 
 def list_gdrive_images(folder_id):
-    """Google Drive APIまたはgdownで画像一覧を取得"""
-    if GOOGLE_API_KEY:
-        return _list_via_api(folder_id)
-    else:
-        return _list_via_gdown(folder_id)
-
-
-def _list_via_api(folder_id):
-    """Google Drive API v3で画像一覧を取得"""
-    url = "https://www.googleapis.com/drive/v3/files"
-    query = f"'{folder_id}' in parents and trashed = false"
-    params = {
-        "q": query,
-        "key": GOOGLE_API_KEY,
-        "fields": "files(id,name,mimeType)",
-        "pageSize": 1000,
-    }
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    files = resp.json().get("files", [])
-
-    images = []
-    for f in files:
-        ext = os.path.splitext(f["name"])[1].lower()
-        if ext in IMAGE_EXTENSIONS:
-            images.append({
-                "id": f["id"],
-                "name": f["name"],
-                "url": f"https://drive.google.com/uc?export=download&id={f['id']}",
-            })
-    return images
+    """公開フォルダをgdownで取得する。APIキー経路は持たない。"""
+    return _list_via_gdown(folder_id)
 
 
 def _list_via_gdown(folder_id):
@@ -287,14 +259,6 @@ def _list_via_gdown(folder_id):
     return images
 
 
-def download_single_image(file_id):
-    """Google Driveから1ファイルをダウンロード"""
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
-
-
 def dump_debug_artifacts(driver, prefix="mixi_debug"):
     """失敗解析用にスクリーンショットとHTMLを保存する"""
     ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
@@ -311,9 +275,17 @@ def dump_debug_artifacts(driver, prefix="mixi_debug"):
 
 # ===== タグ・テキスト生成 =====
 
-def generate_tags(image_name):
-    """ファイル名からハッシュタグを生成"""
-    tags = list(BASE_TAGS)
+def _contains_blocked_term(value, blocked_terms):
+    normalized = str(value).casefold()
+    return any(term.casefold() in normalized for term in blocked_terms if term)
+
+
+def generate_tags(image_name, insights=None):
+    """中央プールを優先し、Safe Fitness禁止語を除外してタグを生成する。"""
+    insights = insights or {}
+    blocked_terms = set(SAFE_FALLBACK_NG)
+    blocked_terms.update(str(v).strip() for v in insights.get("avoid_tags", []) if str(v).strip())
+    tags = list(insights.get("recommended_tags") or BASE_TAGS)
     name_lower = image_name.lower().replace('-', ' ').replace('_', ' ')
     matched = set()
     for keyword, keyword_tags in CONTENT_TAG_MAP.items():
@@ -326,20 +298,21 @@ def generate_tags(image_name):
     seen = set()
     unique_tags = []
     for t in tags:
-        if t.lower() not in seen:
-            seen.add(t.lower())
-            unique_tags.append(t)
-    return unique_tags
+        tag = str(t).strip().lstrip('#')
+        key = tag.casefold()
+        if tag and key not in seen and not _contains_blocked_term(tag, blocked_terms):
+            seen.add(key)
+            unique_tags.append(tag)
+    return unique_tags[:15]
 
 
 def extract_category(image_name):
-    """ファイル名からカテゴリを推定"""
-    parts = image_name.replace('-', ' ').replace('_', ' ').split()
-    skip = {'jpg', 'jpeg', 'png', 'webp', 'img', 'image', 'photo'}
-    for p in parts:
-        if p.lower() not in skip and len(p) > 2:
-            return p.capitalize()
-    return "Muscle Art"
+    """既知のSafe Fitness語だけからカテゴリを返し、IDや固有名詞を漏らさない。"""
+    normalized = image_name.casefold().replace('-', ' ').replace('_', ' ')
+    for keyword, label in CATEGORY_LABELS.items():
+        if keyword in normalized:
+            return label
+    return "筋肉美"
 
 
 def build_title(image_name):
@@ -349,18 +322,36 @@ def build_title(image_name):
     return template.format(category=category)
 
 
-def build_body_text(image_name, tags):
-    """日記本文のプレーンテキストを生成（mixi日記はtextarea）"""
+def build_body_text(image_name, tags, insights=None):
+    """中央プールの短文・CTAからSafe Fitness日記本文を生成する。"""
+    insights = insights or {}
     hashtags = ' '.join([f'#{t}' for t in tags[:15]])
-    caption = random.choice(CAPTION_TEMPLATES)
-    template = random.choice(BODY_TEMPLATES)
+    templates = list(insights.get("recommended_templates") or CAPTION_TEMPLATES)
+    template = random.choice(templates)
+    try:
+        caption = template.format(hashtags=hashtags).strip()
+    except (KeyError, ValueError):
+        caption = random.choice(CAPTION_TEMPLATES)
+    if "{hashtags}" not in template and hashtags:
+        caption = f"{caption}\n\n{hashtags}"
 
-    text = template.format(
-        caption=caption,
-        hashtags=hashtags,
-        patreon_link=PATREON_LINK,
-    )
-    return text.strip() + build_backlink_block()
+    ctas = [str(v).strip() for v in insights.get("recommended_ctas", []) if str(v).strip()]
+    measurable = [value for value in ctas if "utm_source=mixi" in value]
+    cta = random.choice(measurable or ctas or [SAFE_FALLBACK_CTA])
+    return normalize_plain_promotion(f"{caption}\n\n{cta}")
+
+
+def validate_public_payload(title, body_text, tags, insights=None):
+    """Safe Fitness禁止語やファイル由来IDを公開直前にfail-closedで拒否する。"""
+    insights = insights or {}
+    blocked_terms = set(SAFE_FALLBACK_NG)
+    blocked_terms.update(str(v).strip() for v in insights.get("avoid_tags", []) if str(v).strip())
+    combined = "\n".join([title, body_text, " ".join(tags)])
+    hits = sorted(term for term in blocked_terms if _contains_blocked_term(combined, [term]))
+    if hits:
+        raise ValueError(f"Safe Fitness blocked terms: {', '.join(hits)}")
+    if re.search(r"(?i)(?:^|[^0-9a-f])[0-9a-f]{8,}(?:[^0-9a-f]|$)", title):
+        raise ValueError("Hash-like source identifier in public title")
 
 
 # ===== Selenium 日記投稿 =====
@@ -553,13 +544,70 @@ def save_uploaded_log(log):
 
 # ===== メイン =====
 
-def main():
-    # 認証チェック（Cookie方式ではメール/パスワード不要）
-    if not os.path.exists(COOKIE_FILE):
-        print("Error: Cookie未保存。先に save_cookies.py を実行してください。")
-        return 1
+def parse_args():
+    parser = argparse.ArgumentParser(description="mixi diary auto uploader")
+    parser.add_argument("--dry-run", action="store_true", help="Build a preview without browser login or posting")
+    parser.add_argument(
+        "--sample-name",
+        default="",
+        help="Use a synthetic image name for an offline dry-run (requires --dry-run)",
+    )
+    return parser.parse_args()
 
-    if not GDRIVE_FOLDER_ID:
+
+def env_truthy(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def write_dry_run_preview(image, title, body_text, tags, insights):
+    base_dir = os.path.dirname(__file__)
+    html_path = os.path.join(base_dir, DRY_RUN_OUTPUT_HTML)
+    json_path = os.path.join(base_dir, DRY_RUN_OUTPUT_JSON)
+    preview = {
+        "mode": "dry_run",
+        "generated_at_jst": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST"),
+        "selected_image": image.get("name"),
+        "lane": SAFE_LANE,
+        "content_pool": insights.get("updated_at_jst", "fallback"),
+        "title": title,
+        "tags": tags,
+        "body_text": body_text,
+        "cta_has_utm": "utm_source=mixi" in body_text,
+        "live_actions": [],
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(preview, f, ensure_ascii=False, indent=2)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write("<!doctype html><html><head><meta charset='utf-8'>")
+        f.write("<title>mixi dry run preview</title></head><body>")
+        f.write(f"<h1>{html.escape(title)}</h1>")
+        f.write(f"<p><strong>Selected image:</strong> {html.escape(str(image.get('name', '')))}</p>")
+        if image.get("url"):
+            f.write(f"<p><strong>Source:</strong> {html.escape(str(image.get('url')))}</p>")
+        f.write("<h2>Tags</h2><p>")
+        f.write(html.escape(', '.join(tags)))
+        f.write("</p><h2>Body</h2><pre style='white-space: pre-wrap'>")
+        f.write(html.escape(body_text))
+        f.write("</pre></body></html>")
+    print(f"DRY_RUN preview written: {html_path}")
+    print(f"DRY_RUN metadata written: {json_path}")
+
+
+def main():
+    args = parse_args()
+    dry_run = args.dry_run or env_truthy("DRY_RUN")
+
+    if args.sample_name and not dry_run:
+        print("Error: --sample-name requires --dry-run")
+        return 2
+
+    # 認証チェック（Cookie方式ではメール/パスワード不要）
+    if not dry_run and not os.path.exists(COOKIE_FILE):
+        print("Error: Cookie未保存。先に save_cookies.py を実行してください。")
+        write_run_status("HOLD_AUTH", "cookie_file_missing", EXIT_AUTH_HOLD)
+        return EXIT_AUTH_HOLD
+
+    if not args.sample_name and not GDRIVE_FOLDER_ID:
         print("Error: GDRIVE_FOLDER_ID_MIXI が未設定です")
         return 1
 
@@ -570,70 +618,64 @@ def main():
     print("=" * 50)
     print()
 
-    # Google Driveから画像一覧取得
-    print("Google Driveから画像一覧を取得中...")
-    images = list_gdrive_images(GDRIVE_FOLDER_ID)
-    if not images:
-        print("No images found!")
-        return 0
+    if args.sample_name:
+        image = {"id": None, "name": os.path.basename(args.sample_name), "offline_sample": True}
+        available = [image]
+        print("Offline sample mode: source listing skipped")
+    else:
+        # 公開フォルダから画像一覧取得
+        print("公開フォルダから画像一覧を取得中...")
+        images = list_gdrive_images(GDRIVE_FOLDER_ID)
+        if not images:
+            print("No images found!")
+            return 0
 
-    # 未アップロード画像をフィルタ
-    uploaded_log = load_uploaded_log()
-    available = [img for img in images if img["name"] not in uploaded_log]
-    if not available:
-        print("All images already uploaded!")
-        return 0
+        # 未アップロード画像をフィルタ
+        uploaded_log = load_uploaded_log()
+        available = [img for img in images if img["name"] not in uploaded_log]
+        if not available:
+            print("All images already uploaded!")
+            return 0
 
-    print(f"Available: {len(available)} / Total: {len(images)}")
-
-    # ランダムに1枚選択
-    image = random.choice(available)
+        print(f"Available: {len(available)} / Total: {len(images)}")
+        image = random.choice(available)
     print(f"Selected: {image['name']}")
 
-    # タグ生成
-    tags = generate_tags(image["name"])
-
-    # トレンドタグ追加
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'x-auto-uploader'))
-        from trending import get_trending_tags
-        trend_tags = get_trending_tags(max_tags=5)
-        if trend_tags:
-            seen = {t.lower() for t in tags}
-            for t in trend_tags:
-                if t.lower() not in seen:
-                    tags.append(t)
-                    seen.add(t.lower())
-    except ImportError:
-        print("trending.py not found, skipping trend tags")
+    insights = as_insights(
+        SAFE_LANE,
+        platform="mixi",
+        allow_remote=not bool(args.sample_name),
+    )
+    print(f"Content pool: {insights.get('updated_at_jst', 'fallback')}")
+    tags = generate_tags(image["name"], insights)
 
     # タイトル・本文テキスト生成
     title = build_title(image["name"])
-    body_text = build_body_text(image["name"], tags)
+    body_text = build_body_text(image["name"], tags, insights)
+    try:
+        validate_public_payload(title, body_text, tags, insights)
+    except ValueError as exc:
+        print(f"PUBLIC_PAYLOAD_HOLD: {exc}")
+        return 4
 
     print(f"Title: {title}")
     print(f"Tags: {', '.join(tags[:10])}...")
     print()
 
     # ローカル画像パスを決定
+    if dry_run:
+        write_dry_run_preview(image, title, body_text, tags, insights)
+        print("DRY_RUN complete: no source download, browser login, state ledger, or live post attempted.")
+        return 0
+
+    ensure_live_dependencies()
+
     image_path = None
     if image.get("local_path"):
         image_path = os.path.abspath(image["local_path"])
-    elif image.get("id"):
-        # Google Drive APIの画像をダウンロードしてローカルに保存
-        print("Google Driveから画像をダウンロード中...")
-        try:
-            img_data = download_single_image(image["id"])
-            dl_dir = os.path.join(os.path.dirname(__file__), "images")
-            os.makedirs(dl_dir, exist_ok=True)
-            image_path = os.path.abspath(os.path.join(dl_dir, image["name"]))
-            with open(image_path, "wb") as f:
-                f.write(img_data)
-            print(f"ダウンロード完了: {image_path}")
-        except Exception as e:
-            print(f"画像ダウンロードエラー: {e}")
-            # 画像なしでテキストのみ投稿を続行
-            image_path = None
+    else:
+        print("Error: approved local image path is unavailable")
+        return 1
 
     # Seleniumで日記投稿
     driver = None
@@ -656,13 +698,18 @@ def main():
         # Cookieログイン（reCAPTCHA回避）
         if not login_with_cookies(driver):
             print("Cookieログイン失敗! save_cookies.py を再実行してください。")
-            return 1
+            write_run_status("HOLD_AUTH", "cookie_expired_or_unverified", EXIT_AUTH_HOLD)
+            return EXIT_AUTH_HOLD
 
         human_delay(2, 4)
 
         # 日記作成ページに移動
         if not navigate_to_diary_editor(driver):
             print("日記作成ページに移動できません!")
+            if is_auth_redirect(getattr(driver, "current_url", "")):
+                write_run_status("HOLD_AUTH", "session_expired_at_editor", EXIT_AUTH_HOLD)
+                return EXIT_AUTH_HOLD
+            write_run_status("REVISE", "editor_navigation_failed", 1)
             return 1
 
         human_delay(2, 4)
@@ -675,18 +722,23 @@ def main():
             print("=" * 50)
 
             # 成功 -> ログ保存
+            record_publication_result("mixi", {"title": title, "caption": body_text},
+                                      source_locator=driver.current_url, confirmed=True, receipt_status="ui_confirmed")
             uploaded_log.append(image["name"])
             save_uploaded_log(uploaded_log)
+            write_run_status("PASS", "post_confirmed", 0)
             print(f"Remaining: {len(available) - 1}")
             return 0
         else:
             print("投稿失敗!")
+            write_run_status("REVISE", "post_unconfirmed", 1)
             return 1
 
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        write_run_status("REVISE", f"exception:{type(e).__name__}", 1)
         return 1
 
     finally:

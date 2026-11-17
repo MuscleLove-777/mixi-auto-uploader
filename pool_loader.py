@@ -12,11 +12,23 @@ x_account_insights.json 互換の形式に変換する as_insights() を使え�
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 HUB_URL = "https://musclelove-777.github.io/content_pool.json"
 LOCAL_POOL = Path(__file__).resolve().parent / "content_pool.json"
 HTTP_TIMEOUT = 10
 URL_RE = re.compile(r"https?://[^\s)\]>]+")
+
+CTA_HOST_TO_CHANNEL = {
+    "x.com": "x",
+    "www.x.com": "x",
+    "twitter.com": "x",
+    "www.twitter.com": "x",
+}
+
+# Safe Fitnessの公開文面へ、関連性を人手確認していない汎用語や固有名詞を
+# 混ぜない。ブランド関連のbase/trend_tagsだけを利用する。
+GENERIC_TREND_BLOCKED_PLATFORMS = {"facebook", "mixi"}
 
 
 def _with_utm(text: str, platform: str) -> str:
@@ -31,13 +43,16 @@ def _with_utm(text: str, platform: str) -> str:
     return URL_RE.sub(repl, text)
 
 
-def load_pool(lane: str) -> dict:
+def load_pool(lane: str, allow_remote: bool = True) -> dict:
     """レーン(safe_fitness / mature_muscle / adult_fanza)のプールを返す。失敗時は{}。"""
     data = None
     try:
         data = json.loads(LOCAL_POOL.read_text(encoding="utf-8"))
     except Exception:
         data = None
+    if data is None and not allow_remote:
+        print("[pool_loader] local pool unavailable (offline fallback to hardcoded)")
+        return {}
     if data is None:
         try:
             import requests
@@ -56,20 +71,46 @@ def load_pool(lane: str) -> dict:
     out["_generic_trend_candidates"] = data.get("generic_trend_candidates", [])
     out["_version"] = data.get("version", "")
     out["_goal_note"] = data.get("goal_note", "")
+    out["_channel_weights"] = data.get("channel_weights", {})
     return out
 
 
-def as_insights(lane: str, platform: str = "") -> dict:
+def _cta_channel(text: str) -> str:
+    """CTA内URLから中央プールの媒体キーを返す。未知ホストは空文字。"""
+    match = URL_RE.search(text)
+    if not match:
+        return ""
+    try:
+        host = (urlparse(match.group(0)).hostname or "").lower()
+    except ValueError:
+        return ""
+    return CTA_HOST_TO_CHANNEL.get(host, "")
+
+
+def _cta_is_enabled(text: str, channel_weights: dict) -> bool:
+    """中央プールがhold/停止にした媒体へのCTAをfail-closedで除外する。"""
+    channel = _cta_channel(text)
+    if not channel:
+        return True
+    state = channel_weights.get(channel, {}) if isinstance(channel_weights, dict) else {}
+    if not isinstance(state, dict):
+        return False
+    action = str(state.get("action", "")).strip().lower()
+    cadence = state.get("cadence_factor")
+    return action != "hold" and cadence != 0
+
+
+def as_insights(lane: str, platform: str = "", allow_remote: bool = True) -> dict:
     """account_insights互換dictへ変換（recommended_tags/templates/ctas, avoid_tags）。
     platform指定時はCTA内URLへUTMを自動付与（utm_source=platform名）。"""
-    pool = load_pool(lane)
+    pool = load_pool(lane, allow_remote=allow_remote)
     if not pool:
         return {}
     ins = {"updated_at_jst": f"content_pool v{pool.get('_version', '?')}"}
 
     tags = list(pool.get("base_tags", [])) + list(pool.get("trend_tags", []))
     generic = [g for g in pool.get("_generic_trend_candidates", []) if g]
-    if generic:
+    if generic and platform not in GENERIC_TREND_BLOCKED_PLATFORMS:
         tags.append(generic[0])  # 汎用トレンドは最大1枠（憲法第3条）
     if tags:
         ins["recommended_tags"] = tags
@@ -84,6 +125,7 @@ def as_insights(lane: str, platform: str = "") -> dict:
         ins["recommended_templates"] = templates
 
     ctas = [str(c).strip() for c in pool.get("cta_lines", []) if str(c).strip()]
+    ctas = [c for c in ctas if _cta_is_enabled(c, pool.get("_channel_weights", {}))]
     if platform:
         ctas = [_with_utm(c, platform) for c in ctas]
     if ctas:
